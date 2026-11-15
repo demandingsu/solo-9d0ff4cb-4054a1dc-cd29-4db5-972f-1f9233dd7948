@@ -1,9 +1,13 @@
-"""In-process job manager for the paired-end FASTQ QC service.
+"""In-process job manager for the QC and coverage-check services.
 
 Only one API process is assumed.  Every job owns a private directory under
 ``DATA_DIR/jobs``.  Uploads and partial outputs live there, and are removed
-before a stop or failure is reported.  Successful jobs keep only the two
-filtered gzip files.
+before a stop or failure is reported.  Successful QC jobs keep only the two
+filtered gzip files; successful coverage jobs keep only their published
+``coverage.json`` report.
+
+Coverage jobs never copy the QC result pair: they read the published gzip
+files in place, so they add no large files to the data directory.
 
 Concurrency contract
 --------------------
@@ -14,11 +18,16 @@ Concurrency contract
   stop requests (the API maps that to HTTP 409).
 * ``stopping`` is only turned into ``stopped`` after the worker has exited and
   its temporary files have been removed.
+* A coverage report is written to ``coverage.json.part`` and atomically
+  renamed to ``coverage.json`` under the manager lock, so status queries never
+  observe a partial report.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
 import threading
 import uuid
@@ -27,6 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .coverage import CoverageResult, Reference, run_coverage
 from .qc import JobStopped, QCError, QCResult, publish_outputs, run_qc
 
 logger = logging.getLogger(__name__)
@@ -37,6 +47,9 @@ STOPPING = "stopping"
 SUCCEEDED = "succeeded"
 FAILED = "failed"
 STOPPED = "stopped"
+
+KIND_QC = "qc"
+KIND_COVERAGE = "coverage"
 
 TERMINAL_STATUSES = frozenset({SUCCEEDED, FAILED, STOPPED})
 STOPPABLE_STATUSES = frozenset({PENDING, RUNNING})
@@ -60,9 +73,19 @@ def _now() -> str:
 class Job:
     job_id: str
     directory: Path
-    r1_filename: str
-    r2_filename: str
-    min_quality: int
+    kind: str = KIND_QC
+    r1_filename: str | None = None
+    r2_filename: str | None = None
+    min_quality: int | None = None
+    # Coverage jobs read the published outputs of a successful QC job.
+    source_job_id: str | None = None
+    source_r1: Path | None = None
+    source_r2: Path | None = None
+    reference: Reference | None = None
+    min_fragment: int | None = None
+    max_fragment: int | None = None
+    min_depth: int | None = None
+    coverage: CoverageResult | None = None
     status: str = PENDING
     created_at: str = field(default_factory=_now)
     started_at: str | None = None
@@ -102,12 +125,41 @@ class Job:
         return self.directory / "R2.kept.fastq.gz"
 
     @property
+    def part_report(self) -> Path:
+        return self.directory / "coverage.json.part"
+
+    @property
+    def report_path(self) -> Path:
+        return self.directory / "coverage.json"
+
+    @property
     def downloads_ready(self) -> bool:
-        return self.status == SUCCEEDED and self.output_r1.is_file() and self.output_r2.is_file()
+        return (
+            self.kind == KIND_QC
+            and self.status == SUCCEEDED
+            and self.output_r1.is_file()
+            and self.output_r2.is_file()
+        )
+
+    @property
+    def report_ready(self) -> bool:
+        return (
+            self.kind == KIND_COVERAGE
+            and self.status == SUCCEEDED
+            and self.report_path.is_file()
+        )
+
+    def _error_dict(self) -> dict[str, str] | None:
+        if not self.error_code:
+            return None
+        return {"code": self.error_code, "message": self.error_message or ""}
 
     def to_dict(self) -> dict[str, Any]:
+        if self.kind == KIND_COVERAGE:
+            return self._coverage_dict()
         result: dict[str, Any] = {
             "job_id": self.job_id,
+            "kind": KIND_QC,
             "status": self.status,
             "min_quality": self.min_quality,
             "r1_filename": self.r1_filename,
@@ -119,11 +171,7 @@ class Job:
             "total_pairs": self.total_pairs,
             "kept_pairs": self.kept_pairs,
             "discarded_pairs": self.discarded_pairs,
-            "error": (
-                {"code": self.error_code, "message": self.error_message}
-                if self.error_code
-                else None
-            ),
+            "error": self._error_dict(),
             "downloads": None,
         }
         if self.downloads_ready:
@@ -131,6 +179,78 @@ class Job:
                 "r1": f"/jobs/{self.job_id}/download/r1",
                 "r2": f"/jobs/{self.job_id}/download/r2",
             }
+        return result
+
+    def _coverage_dict(self) -> dict[str, Any]:
+        coverage = self.coverage
+        intervals = (
+            [interval.to_dict() for interval in coverage.low_coverage_intervals]
+            if coverage is not None
+            else None
+        )
+        reference = (
+            {
+                "name": self.reference.name,
+                "length": len(self.reference.sequence),
+            }
+            if self.reference is not None
+            else None
+        )
+        result: dict[str, Any] = {
+            "job_id": self.job_id,
+            "kind": KIND_COVERAGE,
+            "status": self.status,
+            "qc_job_id": self.source_job_id,
+            "source_job_id": self.source_job_id,
+            "reference": reference,
+            "reference_name": self.reference.name if reference else None,
+            "reference_length": reference["length"] if reference else None,
+            "min_fragment": self.min_fragment,
+            "max_fragment": self.max_fragment,
+            "fragment_length_range": (
+                [self.min_fragment, self.max_fragment]
+                if self.min_fragment is not None
+                and self.max_fragment is not None
+                else None
+            ),
+            "min_depth": self.min_depth,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "pairs_processed": self.pairs_processed,
+            "total_pairs": coverage.total_pairs if coverage else None,
+            "placed_pairs": coverage.placed_pairs if coverage else None,
+            "ambiguous_pairs": coverage.ambiguous_pairs if coverage else None,
+            "unplaced_pairs": coverage.unplaced_pairs if coverage else None,
+            "placed": coverage.placed_pairs if coverage else None,
+            "ambiguous": coverage.ambiguous_pairs if coverage else None,
+            "unplaced": coverage.unplaced_pairs if coverage else None,
+            "unique_pairs": coverage.placed_pairs if coverage else None,
+            "multimapping_pairs": (
+                coverage.ambiguous_pairs if coverage else None
+            ),
+            "unmapped_pairs": coverage.unplaced_pairs if coverage else None,
+            "pair_counts": (
+                {
+                    "placed": coverage.placed_pairs,
+                    "ambiguous": coverage.ambiguous_pairs,
+                    "unplaced": coverage.unplaced_pairs,
+                }
+                if coverage
+                else None
+            ),
+            "low_coverage_intervals": intervals,
+            # Convenience aliases for the same list.
+            "low_coverage": intervals,
+            "low_coverage_regions": intervals,
+            "result": coverage.to_dict() if coverage else None,
+            "report": (
+                f"/coverage-jobs/{self.job_id}/report"
+                if self.report_ready
+                else None
+            ),
+            "error": self._error_dict(),
+        }
         return result
 
 
@@ -160,7 +280,11 @@ class JobManager:
                 logger.warning("could not remove stale path %s", child)
 
     def create_job(
-        self, r1_filename: str, r2_filename: str, min_quality: int
+        self,
+        r1_filename: str,
+        r2_filename: str,
+        min_quality: int,
+        kind: str = KIND_QC,
     ) -> Job:
         job_id = uuid.uuid4().hex
         directory = self.jobs_dir / job_id
@@ -168,9 +292,43 @@ class JobManager:
         job = Job(
             job_id=job_id,
             directory=directory,
+            kind=kind,
             r1_filename=r1_filename,
             r2_filename=r2_filename,
             min_quality=min_quality,
+        )
+        with self._lock:
+            self._jobs[job_id] = job
+        return job
+
+    def create_coverage_job(
+        self,
+        *,
+        source_job_id: str,
+        source_r1: Path,
+        source_r2: Path,
+        reference: Reference,
+        min_fragment: int,
+        max_fragment: int,
+        min_depth: int,
+    ) -> Job:
+        """Register a coverage job that reads a published QC result pair."""
+        job_id = uuid.uuid4().hex
+        directory = self.jobs_dir / job_id
+        directory.mkdir(parents=True)
+        job = Job(
+            job_id=job_id,
+            directory=directory,
+            kind=KIND_COVERAGE,
+            r1_filename=source_r1.name,
+            r2_filename=source_r2.name,
+            source_job_id=source_job_id,
+            source_r1=source_r1,
+            source_r2=source_r2,
+            reference=reference,
+            min_fragment=min_fragment,
+            max_fragment=max_fragment,
+            min_depth=min_depth,
         )
         with self._lock:
             self._jobs[job_id] = job
@@ -188,7 +346,7 @@ class JobManager:
         thread = threading.Thread(
             target=self._run_job,
             args=(job,),
-            name=f"qc-{job_id[:8]}",
+            name=f"{job.kind}-{job_id[:8]}",
             daemon=True,
         )
         with self._lock:
@@ -215,9 +373,11 @@ class JobManager:
             raise JobNotFound(job_id)
         return job
 
-    def list_jobs(self) -> list[Job]:
+    def list_jobs(self, kind: str | None = None) -> list[Job]:
         with self._lock:
             jobs = list(self._jobs.values())
+        if kind is not None:
+            jobs = [job for job in jobs if job.kind == kind]
         return sorted(jobs, key=lambda j: j.created_at, reverse=True)
 
     def snapshot(self, job_id: str) -> dict[str, Any]:
@@ -250,6 +410,11 @@ class JobManager:
             job = self._jobs.get(job_id)
             if job is None:
                 raise JobNotFound(job_id)
+            if job.kind != KIND_QC:
+                raise JobConflict(
+                    "this job has no downloadable QC output; it is a "
+                    "coverage job"
+                )
             if job.status != SUCCEEDED:
                 raise JobConflict(
                     f"job status is {job.status!r}; downloads are only "
@@ -258,6 +423,22 @@ class JobManager:
             if not (job.output_r1.is_file() and job.output_r2.is_file()):
                 raise JobConflict("result files are no longer available")
             return job.output_r1, job.output_r2
+
+    def coverage_report_path(self, job_id: str) -> Path:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise JobNotFound(job_id)
+            if job.kind != KIND_COVERAGE:
+                raise JobConflict("this job is not a coverage job")
+            if job.status != SUCCEEDED:
+                raise JobConflict(
+                    f"job status is {job.status!r}; the coverage report is "
+                    "only available after successful completion"
+                )
+            if not job.report_path.is_file():
+                raise JobConflict("coverage report is no longer available")
+            return job.report_path
 
     # -- worker ----------------------------------------------------------
     def _run_job(self, job: Job) -> None:
@@ -278,15 +459,27 @@ class JobManager:
             return
 
         try:
-            result = run_qc(
-                job.input_r1,
-                job.input_r2,
-                job.part_r1,
-                job.part_r2,
-                job.min_quality,
-                job.stop_event,
-                progress_cb=lambda pairs: self._set_progress(job, pairs),
-            )
+            if job.kind == KIND_COVERAGE:
+                result = run_coverage(
+                    job.source_r1,
+                    job.source_r2,
+                    job.reference,
+                    job.min_fragment,
+                    job.max_fragment,
+                    job.min_depth,
+                    job.stop_event,
+                    progress_cb=lambda pairs: self._set_progress(job, pairs),
+                )
+            else:
+                result = run_qc(
+                    job.input_r1,
+                    job.input_r2,
+                    job.part_r1,
+                    job.part_r2,
+                    job.min_quality,
+                    job.stop_event,
+                    progress_cb=lambda pairs: self._set_progress(job, pairs),
+                )
         except JobStopped:
             self._finish_stopped(job)
         except QCError as exc:
@@ -295,7 +488,10 @@ class JobManager:
             logger.exception("unexpected error in job %s", job.job_id)
             self._finish_failed(job, "internal_error", str(exc))
         else:
-            self._finish_completed(job, result)
+            if job.kind == KIND_COVERAGE:
+                self._finish_coverage_completed(job, result)
+            else:
+                self._finish_completed(job, result)
 
     def _set_progress(self, job: Job, pairs: int) -> None:
         with self._lock:
@@ -327,6 +523,55 @@ class JobManager:
         if stop_wins:
             self._finish_stopped(job)
             return
+        self._cleanup_inputs(job)
+
+    def _finish_coverage_completed(
+        self, job: Job, result: CoverageResult
+    ) -> None:
+        # A report is only produced after the entire stream was consumed
+        # successfully.  It is first written to ``coverage.json.part`` and
+        # published by an atomic rename, under the same lock used by stop
+        # requests, so a failed/stopped job never exposes a partial report.
+        try:
+            with open(job.part_report, "w", encoding="utf-8") as handle:
+                json.dump(result.to_dict(), handle, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            self._finish_failed(
+                job, "internal_error", f"could not write coverage report: {exc}"
+            )
+            return
+
+        with self._lock:
+            if job.status == STOPPING or job.stop_event.is_set():
+                stop_wins = True
+                publish_error = None
+            else:
+                stop_wins = False
+                publish_error = None
+                try:
+                    os.replace(job.part_report, job.report_path)
+                except OSError as exc:  # pragma: no cover - disk failure
+                    publish_error = exc
+                else:
+                    job.coverage = result
+                    job.total_pairs = result.total_pairs
+                    job.pairs_processed = result.total_pairs
+                    job.finished_at = _now()
+                    job.status = SUCCEEDED
+        if stop_wins:
+            self._finish_stopped(job)
+            return
+        if publish_error is not None:  # pragma: no cover - disk failure
+            self._finish_failed(
+                job,
+                "internal_error",
+                f"could not publish coverage report: {publish_error}",
+            )
+            return
+        # Coverage jobs own no input copies; the coverage report is the result.
         self._cleanup_inputs(job)
 
     def _finish_failed(self, job: Job, code: str, message: str) -> None:

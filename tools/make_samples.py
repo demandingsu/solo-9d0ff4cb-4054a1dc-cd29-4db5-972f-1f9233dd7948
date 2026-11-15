@@ -7,6 +7,9 @@ Produces, under ``samples/``:
   quality bases in one or both ends), used to show discarding behaviour.
 * ``truncated_R2.fastq.gz`` -- a gzip stream that ends mid-record; pairing it
   with ``good_R1.fastq.gz`` makes the job fail.
+* ``target_R1.fastq.gz`` / ``target_R2.fastq.gz`` / ``target_reference.fa`` --
+  a hand-built 200 bp reference with a 100 bp covered amplicon and a 100 bp
+  uncovered region, for the coverage-check endpoint.
 
 Run from the repository root: ``python tools/make_samples.py``.
 """
@@ -18,6 +21,43 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SAMPLES = ROOT / "samples"
+
+# A deterministic 240 bp target reference.  Three tiled 100 bp fragments
+# cover it unevenly; positions 120..140 are deliberately left uncovered.
+TARGET_REFERENCE = (
+    "ACGTTGCAAGCTTCGATCGATTAGGCATCGATCGTAGCTAGGCCTTAACGTTAGCCATGA"
+    "CTAGGTACCATTCGAGCTTTAGCTAACCGTATGGCATTCGAGCTAACCGTAGGATCCGTA"
+    "GGCATCGATTAGGCATCGATCGTAGCTAACCGTAGGATCCGTACTAGGTACCATTCGAGC"
+    "TTAACGTTAGCCATGACTAGGTACCATTCGAGCTTTAGCTAACCGTATGGCATTCGAGCT"
+)
+
+_COMPLEMENT = str.maketrans("ACGT", "TGCA")
+
+
+def reverse_complement(sequence: str) -> str:
+    return sequence.translate(_COMPLEMENT)[::-1]
+
+
+def target_reads() -> tuple[str, str, list[tuple[int, int]]]:
+    """Return paired FASTQ text plus ``(R1 start, R2 start)`` placements.
+
+    Reads are 60 bp and every fragment is 100 bp:
+    ``(0, 40) -> [0, 100)``, ``(20, 60) -> [20, 120)``,
+    ``(140, 180) -> [140, 240)``.  Depth is 1 at 0..20, 2 at 20..100,
+    1 at 100..120, 0 at 120..140 and 1 at 140..240, so a ``min_depth`` of 1
+    reports exactly ``[120, 140)``.
+    """
+    placements = [(0, 40), (20, 60), (140, 180)]
+    r1_parts: list[str] = []
+    r2_parts: list[str] = []
+    for index, (r1_start, r2_start) in enumerate(placements, start=1):
+        r1_seq = TARGET_REFERENCE[r1_start : r1_start + 60]
+        r2_seq = reverse_complement(
+            TARGET_REFERENCE[r2_start : r2_start + 60]
+        )
+        r1_parts.append(record(f"target{index:04d}/1", r1_seq, "I" * 60))
+        r2_parts.append(record(f"target{index:04d}/2", r2_seq, "I" * 60))
+    return "".join(r1_parts), "".join(r2_parts), placements
 
 
 def record(name: str, sequence: str, qualities: str) -> str:
@@ -116,6 +156,19 @@ def build() -> None:
     # R1 valid; R2 truncated at the end of the gzip stream.
     write_gzip(SAMPLES / "truncated_R1.fastq.gz", r1)
     write_truncated(SAMPLES / "truncated_R2.fastq.gz", r2)
+
+    target_r1, target_r2, _ = target_reads()
+    write_gzip(SAMPLES / "target_R1.fastq.gz", target_r1)
+    write_gzip(SAMPLES / "target_R2.fastq.gz", target_r2)
+    (SAMPLES / "target_reference.fa").write_text(
+        ">target_amplicon\n"
+        + "\n".join(
+            TARGET_REFERENCE[start : start + 60]
+            for start in range(0, len(TARGET_REFERENCE), 60)
+        )
+        + "\n",
+        encoding="ascii",
+    )
 
     print(f"samples written to {SAMPLES}")
 
